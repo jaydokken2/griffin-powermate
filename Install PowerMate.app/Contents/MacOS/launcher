@@ -1,0 +1,4 @@
+#!/bin/bash
+# Launcher that opens Terminal with the install script
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+open -a Terminal "$SCRIPT_DIR/install.sh"
