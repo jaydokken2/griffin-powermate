@@ -9,7 +9,7 @@ import CoreAudio
 let kPowerMateVendorID:  Int = 0x077d  // Griffin Technology
 let kPowerMateProductID: Int = 0x0410  // PowerMate
 
-let kVolumeStep: Float32 = 0.02  // Volume change per rotation tick (~2%)
+let kVolumeStep: Float32 = 0.02  // Fine volume change per rotation event (~2%)
 
 // MARK: - Logging
 
@@ -19,6 +19,107 @@ func log(_ message: String) {
     let timestamp = formatter.string(from: Date())
     print("[\(timestamp)] \(message)")
     fflush(stdout)
+}
+
+// MARK: - Volume Overlay HUD
+
+class VolumeOverlayView: NSView {
+    var volumeLevel: Float32 = 0.0
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bounds = self.bounds
+        let path = NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12)
+        NSColor(white: 0.1, alpha: 0.85).setFill()
+        path.fill()
+
+        // Volume bar background
+        let barMargin: CGFloat = 20
+        let barHeight: CGFloat = 8
+        let barY: CGFloat = bounds.midY + 4
+        let barRect = NSRect(x: barMargin, y: barY, width: bounds.width - barMargin * 2, height: barHeight)
+        NSColor(white: 0.3, alpha: 1.0).setFill()
+        NSBezierPath(roundedRect: barRect, xRadius: 4, yRadius: 4).fill()
+
+        // Volume bar fill
+        let fillWidth = (bounds.width - barMargin * 2) * CGFloat(volumeLevel)
+        if fillWidth > 0 {
+            let fillRect = NSRect(x: barMargin, y: barY, width: fillWidth, height: barHeight)
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: fillRect, xRadius: 4, yRadius: 4).fill()
+        }
+
+        // Percentage text
+        let pctString = "\(Int(volumeLevel * 100))%"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor(white: 1.0, alpha: 0.8),
+            .font: NSFont.systemFont(ofSize: 14, weight: .medium)
+        ]
+        let attrStr = NSAttributedString(string: pctString, attributes: attrs)
+        let strSize = attrStr.size()
+        let strPoint = NSPoint(x: (bounds.width - strSize.width) / 2, y: barY - strSize.height - 6)
+        attrStr.draw(at: strPoint)
+    }
+}
+
+class VolumeOverlay {
+    static let shared = VolumeOverlay()
+
+    private var window: NSWindow?
+    private var overlayView: VolumeOverlayView?
+    private var hideTimer: Timer?
+
+    private init() {}
+
+    func show(volume: Float32) {
+        DispatchQueue.main.async { [self] in
+            if window == nil {
+                let w = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 200, height: 50),
+                    styleMask: .borderless,
+                    backing: .buffered,
+                    defer: false
+                )
+                w.isOpaque = false
+                w.backgroundColor = .clear
+                w.level = .floating
+                w.ignoresMouseEvents = true
+                w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+                w.hasShadow = true
+
+                let view = VolumeOverlayView(frame: NSRect(x: 0, y: 0, width: 200, height: 50))
+                w.contentView = view
+
+                window = w
+                overlayView = view
+            }
+
+            // Center on main screen
+            if let screen = NSScreen.main {
+                let screenFrame = screen.frame
+                let winSize = window!.frame.size
+                let x = screenFrame.midX - winSize.width / 2
+                let y = screenFrame.midY - winSize.height / 2 + 100
+                window!.setFrameOrigin(NSPoint(x: x, y: y))
+            }
+
+            overlayView?.volumeLevel = volume
+            overlayView?.needsDisplay = true
+
+            window?.alphaValue = 1.0
+            window?.orderFrontRegardless()
+
+            // Reset fade timer
+            hideTimer?.invalidate()
+            hideTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [self] _ in
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = 0.3
+                    window?.animator().alphaValue = 0.0
+                }, completionHandler: {
+                    self.window?.orderOut(nil)
+                })
+            }
+        }
+    }
 }
 
 // MARK: - Volume Control via CoreAudio
@@ -90,6 +191,7 @@ func adjustVolume(up: Bool) {
     let clamped = min(max(newVol, 0.0), 1.0)
     setVolume(clamped)
     log("Volume \(up ? "up" : "down"): \(Int(clamped * 100))%")
+    VolumeOverlay.shared.show(volume: clamped)
 }
 
 // MARK: - Media Key Simulation
@@ -132,7 +234,6 @@ func sendMediaKey(_ keyCode: Int) {
 
 // MARK: - MediaRemote Framework (private, for play/pause without Accessibility)
 
-// Load MediaRemote.framework dynamically
 let mrBundle = CFBundleCreate(kCFAllocatorDefault,
     URL(fileURLWithPath: "/System/Library/PrivateFrameworks/MediaRemote.framework") as CFURL)
 
@@ -150,30 +251,23 @@ func getMRSendCommand() -> MRMediaRemoteSendCommandFunc? {
     return unsafeBitCast(ptr, to: MRMediaRemoteSendCommandFunc.self)
 }
 
-// MediaRemote command constants
 let kMRTogglePlayPause: UInt32 = 2
-let kMRPlay: UInt32 = 0
-let kMRPause: UInt32 = 1
 
 func sendPlayPause() {
-    // Use MediaRemote private framework — no Accessibility permission needed
     if let sendCommand = getMRSendCommand() {
         let result = sendCommand(kMRTogglePlayPause, nil)
         log("Play/Pause toggled via MediaRemote (success: \(result))")
         return
     }
-
-    // Fallback: try CGEvent media key (requires Accessibility)
     sendMediaKey(16)
     log("Play/Pause toggled (media key fallback)")
 }
 
 // MARK: - PowerMate LED Control
 
-let kLEDBrightness: UInt8 = 128  // Fixed brightness (always on)
+let kLEDBrightness: UInt8 = 128
 
 func setLEDBrightness(_ device: IOHIDDevice, brightness: UInt8) {
-    // Use the C helper to send USB vendor control request for LED
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/local/bin/powermate-led")
     task.arguments = [String(brightness)]
@@ -187,7 +281,6 @@ func setLEDBrightness(_ device: IOHIDDevice, brightness: UInt8) {
     }
 }
 
-// Keep LED on by refreshing periodically
 func startLEDKeepAlive() {
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
     timer.schedule(deadline: .now(), repeating: 5.0)
@@ -197,7 +290,6 @@ func startLEDKeepAlive() {
         }
     }
     timer.resume()
-    // Store timer to prevent deallocation
     ledTimer = timer
 }
 
@@ -208,35 +300,43 @@ var ledTimer: DispatchSourceTimer?
 var connectedDevice: IOHIDDevice?
 var buttonIsDown = false
 
-func inputCallback(
+// Raw report buffer for low-level HID access
+var rawReportBuffer = [UInt8](repeating: 0, count: 64)
+
+// Raw report callback — operates below the value callback, may catch events it misses
+func rawReportCallback(
     context: UnsafeMutableRawPointer?,
     result: IOReturn,
     sender: UnsafeMutableRawPointer?,
-    value: IOHIDValue
+    type: IOHIDReportType,
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    reportLength: CFIndex
 ) {
-    let element = IOHIDValueGetElement(value)
-    let usage = IOHIDElementGetUsage(element)
-    let usagePage = IOHIDElementGetUsagePage(element)
-    let intValue = IOHIDValueGetIntegerValue(value)
+    guard reportLength >= 2 else { return }
 
-    if usagePage == kHIDPage_GenericDesktop && (usage == 0x37 || usage == 0x33) {
-        // Dial rotation: 0x37 = Dial, 0x33 = Rx (PowerMate reports as Rx)
-        if intValue > 0 {
-            adjustVolume(up: true)
-            if let device = connectedDevice { setLEDBrightness(device, brightness: kLEDBrightness) }
-        } else if intValue < 0 {
-            adjustVolume(up: false)
-            if let device = connectedDevice { setLEDBrightness(device, brightness: kLEDBrightness) }
-        }
-    } else if usagePage == kHIDPage_Button && usage == 1 {
-        if intValue == 1 && !buttonIsDown {
-            buttonIsDown = true
-            sendPlayPause()
-        } else if intValue == 0 {
-            buttonIsDown = false
-        }
+    let buttonState = report[0]
+    let rotationDelta = Int8(bitPattern: report[1])
+
+    // Handle rotation from raw report
+    if rotationDelta != 0 {
+        let current = getVolume() ?? 0.5
+        let delta = kVolumeStep * Float32(rotationDelta)
+        let clamped = min(max(current + delta, 0.0), 1.0)
+        setVolume(clamped)
+        log("Volume: \(Int(clamped * 100))%")
+        VolumeOverlay.shared.show(volume: clamped)
+    }
+
+    // Handle button from raw report
+    if buttonState == 1 && !buttonIsDown {
+        buttonIsDown = true
+        sendPlayPause()
+    } else if buttonState == 0 && buttonIsDown {
+        buttonIsDown = false
     }
 }
+
 
 func matchCallback(
     context: UnsafeMutableRawPointer?,
@@ -251,7 +351,19 @@ func matchCallback(
         log("  Product: \(product)")
     }
 
-    // Set LED on and start keep-alive timer
+    // Set faster report interval (1ms)
+    IOHIDDeviceSetProperty(device, kIOHIDReportIntervalKey as CFString, 1000 as CFNumber)
+
+    // Register raw report callback for low-level HID access
+    IOHIDDeviceRegisterInputReportCallback(
+        device,
+        &rawReportBuffer,
+        rawReportBuffer.count,
+        rawReportCallback,
+        nil
+    )
+    log("  Raw report callback registered")
+
     setLEDBrightness(device, brightness: kLEDBrightness)
     startLEDKeepAlive()
     log("  LED on (brightness: \(kLEDBrightness), keep-alive started)")
@@ -298,11 +410,17 @@ func checkAccessibilityPermission() {
 
 // MARK: - Main
 
-log("PowerMate Daemon v2.1 starting...")
+log("PowerMate Daemon v3.0 starting...")
 log("Searching for Griffin PowerMate (VID: 0x077d, PID: 0x0410)...")
 
 setupSignalHandlers()
 checkAccessibilityPermission()
+
+// Set up as background app (no Dock icon, but can show windows)
+let app = NSApplication.shared
+app.setActivationPolicy(.prohibited)
+// Force connection to window server
+let _ = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: true)
 
 let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
@@ -314,7 +432,6 @@ IOHIDManagerSetDeviceMatching(manager, matchDict as CFDictionary)
 
 IOHIDManagerRegisterDeviceMatchingCallback(manager, matchCallback, nil)
 IOHIDManagerRegisterDeviceRemovalCallback(manager, removeCallback, nil)
-IOHIDManagerRegisterInputValueCallback(manager, inputCallback, nil)
 
 IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
 
@@ -327,4 +444,4 @@ if openResult != kIOReturnSuccess {
 
 log("HID Manager open. Waiting for PowerMate device...")
 
-CFRunLoopRun()
+app.run()

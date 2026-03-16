@@ -1,12 +1,13 @@
 # Griffin PowerMate Controller for macOS
 
-A lightweight macOS daemon that brings the Griffin PowerMate USB knob back to life on modern macOS (Sequoia and later). No kernel extensions, no third-party drivers — just a native daemon using IOKit HID.
+A lightweight macOS daemon that brings the **Griffin PowerMate USB** (corded, VID `0x077d`, PID `0x0410`) back to life on modern macOS. No kernel extensions, no third-party drivers — just a native daemon using IOKit HID.
 
 ## Features
 
-- **Volume control** — Rotate the knob to adjust system volume
-- **Play/Pause** — Press the knob to toggle media playback (uses Apple's MediaRemote framework — no Accessibility permission needed)
-- **LED** — Blue LED stays on persistently while the daemon is running, with a keep-alive timer to prevent it from turning off
+- **Smooth volume control** — Rotate the knob to adjust system volume with fine 2% increments. Uses raw HID report callbacks for responsive, low-latency input — even at slow rotation speeds
+- **Volume HUD** — A minimal on-screen overlay shows the current volume level as you turn the knob
+- **Play/Pause** — Press the knob to toggle media playback (uses Apple's private MediaRemote framework — no Accessibility permission needed)
+- **Persistent LED** — The blue LED stays on while the daemon is running, with a keep-alive timer that refreshes every 5 seconds
 - **Hot-plug support** — Automatically detects when the PowerMate is connected or disconnected
 - **Launch at login** — Runs as a background LaunchAgent, starts automatically at login
 
@@ -36,8 +37,8 @@ This stops the daemon, removes the binary, and removes the LaunchAgent.
 
 The daemon uses three macOS frameworks:
 
-- **IOKit HID** — Reads button presses and rotation events from the PowerMate USB device
-- **CoreAudio** — Directly adjusts the default output device volume (no media key simulation needed for volume)
+- **IOKit HID** — Connects to the PowerMate via `IOHIDDeviceRegisterInputReportCallback` for raw USB HID reports. This bypasses macOS's high-level HID value processing, which debounces and filters slow rotation events. Reading raw reports ensures every encoder tick is captured, even at very slow rotation speeds.
+- **CoreAudio** — Directly adjusts the default output device volume via `kAudioDevicePropertyVolumeScalar`
 - **MediaRemote** (private framework) — Sends play/pause commands to the active media player without requiring Accessibility permission
 
 The LED is controlled via USB vendor control requests (the same protocol used by the Linux kernel driver), implemented in a small C helper (`powermate-led`) since the USB control message macros don't bridge to Swift.
@@ -46,9 +47,9 @@ The LED is controlled via USB vendor control requests (the same protocol used by
 
 ```
 PowerMate/
-  main.swift          # Main daemon source code
-  powermate-led.c     # LED control helper (USB vendor requests)
-Install PowerMate.app  # Double-click installer
+  main.swift              # Main daemon source code
+  powermate-led.c         # LED control helper (USB vendor requests)
+Install PowerMate.app     # Double-click installer
 Uninstall PowerMate.command
 com.powermate.daemon.plist  # LaunchAgent configuration
 ```
@@ -59,13 +60,14 @@ com.powermate.daemon.plist  # LaunchAgent configuration
 - **Play/pause not working:** The daemon uses Apple's MediaRemote framework which should work without extra permissions. Check the log for errors.
 - **LED not staying on:** The daemon refreshes the LED every 5 seconds. If it still turns off, check `/tmp/powermate-daemon.log` for LED errors.
 - **Daemon not running:** Check `launchctl list | grep powermate` and review logs at `/tmp/powermate-daemon.log`
-- **Wrong device:** This only supports the original corded USB PowerMate (VID `0x077d`, PID `0x0410`), not the Bluetooth PowerMate.
+- **Wrong device:** This only supports the original corded USB PowerMate (VID `0x077d`, PID `0x0410`), not the Bluetooth version.
 
 ## Technical Notes
 
-- The PowerMate reports dial rotation as HID usage `0x33` (Rx axis), not the standard `0x37` (Dial) — the daemon handles both
+- The PowerMate reports dial rotation as HID usage `0x33` (Rx axis), not the standard `0x37` (Dial)
+- macOS's `IOHIDManagerRegisterInputValueCallback` silently drops slow rotation events due to internal debouncing. The fix is to use `IOHIDDeviceRegisterInputReportCallback` to read raw 6-byte USB reports directly (byte 0 = button state, byte 1 = signed rotation delta)
 - LED control requires USB vendor control requests (`bmRequestType=0x41, bRequest=0x01, wValue=0x01, wIndex=brightness`) — standard HID output/feature reports are silently ignored by the device
-- Volume is adjusted in ~2% increments per rotation tick via `kAudioDevicePropertyVolumeScalar`
+- Volume is adjusted in ~2% increments per rotation tick, with magnitude scaling for faster turns
 
 ## License
 

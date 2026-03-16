@@ -3,3 +3,5 @@
 *.dSYM/
 build/
 .claude/
+powermate-daemon
+PowerMate/powermate-daemon
